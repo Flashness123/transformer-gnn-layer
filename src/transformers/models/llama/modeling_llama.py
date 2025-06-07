@@ -44,9 +44,32 @@ from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import LossKwargs, auto_docstring, can_return_tuple, logging
 from .configuration_llama import LlamaConfig
 
+from torch_geometric.nn import GCNConv
+
+
 
 logger = logging.get_logger(__name__)
 
+
+from ...cache_utils import DynamicCache
+
+class GCNEnhancedDynamicCache(DynamicCache):
+    def __init__(self):
+        super().__init__()
+        self.gcn_caches = []
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        # Update attention cache
+        key_states, value_states = super().update(key_states, value_states, layer_idx, cache_kwargs)
+        # Store GCN cache (if provided)
+        if "gcn_cache" in cache_kwargs:
+            while len(self.gcn_caches) <= layer_idx:
+                self.gcn_caches.append(None)
+            self.gcn_caches[layer_idx] = cache_kwargs["gcn_cache"]
+        return key_states, value_states
+
+    def get_gcn_cache(self, layer_idx):
+        return self.gcn_caches[layer_idx] if layer_idx < len(self.gcn_caches) else None
 
 @use_kernel_forward_from_hub("RMSNorm")
 class LlamaRMSNorm(nn.Module):
@@ -227,6 +250,7 @@ class LlamaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        gcn_cache: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
@@ -240,8 +264,7 @@ class LlamaAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position, "gcn_cache": gcn_cache}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
@@ -261,7 +284,7 @@ class LlamaAttention(nn.Module):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, attn_weights, past_key_value
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
@@ -316,6 +339,95 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
 
         return outputs
 
+class ModifiedLlamaDecoderLayer(LlamaDecoderLayer):
+    def __init__(self, config: LlamaConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.layer_idx = layer_idx
+        self.gcn = GCNConv(
+            in_channels=config.hidden_size,
+            out_channels=config.hidden_size,
+            improved=False,
+            cached=False,
+            add_self_loops=True
+        )
+        self.gcn_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.gcn_dropout = nn.Dropout(0.3)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        edge_index: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+        # Apply GCN layer
+        gcn_cache = None
+        if edge_index is not None:
+            if use_cache and isinstance(past_key_value, GCNEnhancedDynamicCache):
+                gcn_cache = past_key_value.get_gcn_cache(self.layer_idx)
+                if gcn_cache is not None:
+                    hidden_states = gcn_cache
+                else:
+                    batch_size, seq_len, hidden_dim = hidden_states.shape
+                    gcn_input = hidden_states.view(-1, hidden_dim)
+                    gcn_output = self.gcn(gcn_input, edge_index)
+                    gcn_output = self.gcn_dropout(gcn_output)
+                    gcn_output = self.gcn_norm(gcn_output)
+                    gcn_output = gcn_output.view(batch_size, seq_len, hidden_dim)
+                    hidden_states = gcn_output
+                    gcn_cache = gcn_output
+                    #print(f"GCN output norm: {gcn_output.norm():.2f}")
+            else:
+                batch_size, seq_len, hidden_dim = hidden_states.shape
+                gcn_input = hidden_states.view(-1, hidden_dim)
+                gcn_output = self.gcn(gcn_input, edge_index)
+                gcn_output = self.gcn_dropout(gcn_output)
+                gcn_output = self.gcn_norm(gcn_output)
+                gcn_output = gcn_output.view(batch_size, seq_len, hidden_dim)
+                hidden_states = gcn_output
+                #print(f"GCN output norm: {gcn_output.norm():.2f}")
+                if use_cache:
+                    gcn_cache = gcn_output
+        else:
+            hidden_states = hidden_states
+
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        if use_cache:
+            outputs += ((present_key_value, gcn_cache),)
+
+        return outputs
 
 @auto_docstring
 class LlamaPreTrainedModel(PreTrainedModel):
@@ -470,6 +582,108 @@ class LlamaModel(LlamaPreTrainedModel):
             attentions=all_self_attns,
         )
 
+class ModifiedLlamaModel(LlamaModel):
+    def __init__(self, config: LlamaConfig):
+        super().__init__(config)
+        self.layers = nn.ModuleList(
+            [ModifiedLlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        edge_index: Optional[torch.LongTensor] = None,  # Add edge_index
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+    ) -> BaseModelOutputWithPast:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            use_cache = False
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+        )
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = () if use_cache else None
+
+        for decoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                edge_index=edge_index,  # Pass edge_index
+                **flash_attn_kwargs,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_decoder_cache += (layer_outputs[-1],)  # Includes (present_key_value, gcn_cache)
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_decoder_cache if use_cache else None,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
@@ -582,7 +796,60 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
+class ModifiedLlamaForCausalLM(LlamaForCausalLM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = ModifiedLlamaModel(config)
 
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        edge_index: Optional[torch.LongTensor] = None,  # Add edge_index
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> CausalLMOutputWithPast:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            edge_index=edge_index,  # Pass edge_index
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        logits = self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+    
 @auto_docstring(
     custom_intro="""
     The LLaMa Model transformer with a sequence classification head on top (linear layer).
@@ -825,4 +1092,5 @@ __all__ = [
     "LlamaForSequenceClassification",
     "LlamaForQuestionAnswering",
     "LlamaForTokenClassification",
+    "ModifiedLlamaForCausalLM"
 ]
