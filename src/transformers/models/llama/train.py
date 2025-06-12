@@ -48,9 +48,9 @@ test_mask = test_mask.to(device)
 # Configure LLaMA
 config = LlamaConfig(
     hidden_size=1433,
-    num_hidden_layers=2,
+    num_hidden_layers=4,
     num_attention_heads=11,
-    intermediate_size=2048,
+    intermediate_size=1024,
     max_position_embeddings=2708,
     vocab_size=0,  # No embedding layer
     output_hidden_states=True

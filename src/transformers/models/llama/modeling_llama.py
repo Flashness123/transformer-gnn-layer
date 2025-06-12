@@ -314,7 +314,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights = self.self_attn(
+        attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -325,6 +325,11 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+        if use_cache:
+            hidden_states, self_attn_weights, present_key_value = attn_outputs
+        else:
+            hidden_states, self_attn_weights = attn_outputs
+            present_key_value = None
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -370,7 +375,7 @@ class ModifiedLlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -381,8 +386,14 @@ class ModifiedLlamaDecoderLayer(LlamaDecoderLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+        # Handle self_attn output based on use_cache and output_attentions
+        if use_cache:
+            hidden_states, self_attn_weights, present_key_value = attn_outputs
+        else:
+            hidden_states, self_attn_weights = attn_outputs
+            present_key_value = None
 
-        # Apply GCN layer
+        # Apply GCN layer (exactly once)
         gcn_cache = None
         if edge_index is not None:
             if use_cache and isinstance(past_key_value, GCNEnhancedDynamicCache):
@@ -398,7 +409,6 @@ class ModifiedLlamaDecoderLayer(LlamaDecoderLayer):
                     gcn_output = gcn_output.view(batch_size, seq_len, hidden_dim)
                     hidden_states = gcn_output
                     gcn_cache = gcn_output
-                    #print(f"GCN output norm: {gcn_output.norm():.2f}")
             else:
                 batch_size, seq_len, hidden_dim = hidden_states.shape
                 gcn_input = hidden_states.view(-1, hidden_dim)
@@ -407,11 +417,8 @@ class ModifiedLlamaDecoderLayer(LlamaDecoderLayer):
                 gcn_output = self.gcn_norm(gcn_output)
                 gcn_output = gcn_output.view(batch_size, seq_len, hidden_dim)
                 hidden_states = gcn_output
-                #print(f"GCN output norm: {gcn_output.norm():.2f}")
                 if use_cache:
                     gcn_cache = gcn_output
-        else:
-            hidden_states = hidden_states
 
         hidden_states = residual + hidden_states
 
@@ -428,6 +435,7 @@ class ModifiedLlamaDecoderLayer(LlamaDecoderLayer):
             outputs += ((present_key_value, gcn_cache),)
 
         return outputs
+    
 
 @auto_docstring
 class LlamaPreTrainedModel(PreTrainedModel):
@@ -581,12 +589,15 @@ class LlamaModel(LlamaPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-
+    
 class ModifiedLlamaModel(LlamaModel):
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
+        # Place GCN in the 0.75th layer (e.g., layer 1 for num_hidden_layers=2)
+        gcn_layer_idx = int(0.75 * config.num_hidden_layers)
         self.layers = nn.ModuleList(
-            [ModifiedLlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [LlamaDecoderLayer(config, layer_idx) if layer_idx != gcn_layer_idx else ModifiedLlamaDecoderLayer(config, layer_idx)
+             for layer_idx in range(config.num_hidden_layers)]
         )
 
     def forward(
@@ -600,7 +611,7 @@ class ModifiedLlamaModel(LlamaModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        edge_index: Optional[torch.LongTensor] = None,  # Add edge_index
+        edge_index: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -622,7 +633,7 @@ class ModifiedLlamaModel(LlamaModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
+            past_key_values = GCNEnhancedDynamicCache() if edge_index is not None else DynamicCache()
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -648,7 +659,8 @@ class ModifiedLlamaModel(LlamaModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        for decoder_layer in self.layers:
+        gcn_layer_idx = int(0.75 * self.config.num_hidden_layers)
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -661,14 +673,17 @@ class ModifiedLlamaModel(LlamaModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                edge_index=edge_index,  # Pass edge_index
+                edge_index=edge_index if layer_idx == gcn_layer_idx else None,
                 **flash_attn_kwargs,
             )
 
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[-1],)  # Includes (present_key_value, gcn_cache)
+                if layer_idx == gcn_layer_idx:
+                    next_decoder_cache += (layer_outputs[-1],)
+                else:
+                    next_decoder_cache += ((layer_outputs[-1], None),)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -813,7 +828,7 @@ class ModifiedLlamaForCausalLM(LlamaForCausalLM):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        edge_index: Optional[torch.LongTensor] = None,  # Add edge_index
+        edge_index: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> CausalLMOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -831,7 +846,7 @@ class ModifiedLlamaForCausalLM(LlamaForCausalLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
-            edge_index=edge_index,  # Pass edge_index
+            edge_index=edge_index,
             **kwargs,
         )
 
@@ -1092,5 +1107,6 @@ __all__ = [
     "LlamaForSequenceClassification",
     "LlamaForQuestionAnswering",
     "LlamaForTokenClassification",
-    "ModifiedLlamaForCausalLM"
+    "ModifiedLlamaForCausalLM",
+    "ModifiedLlamaModel"
 ]
